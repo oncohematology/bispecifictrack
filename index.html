@@ -1,0 +1,782 @@
+import { useState, useEffect, useRef } from "react";
+
+// ─── CONSTANTS ───────────────────────────────────────────────────────────────
+
+const STORAGE_KEY = "bsab_v2";
+
+const DRUGS = ["Mosunetuzumab", "Epcoritamab", "Glofitamab", "Odronextamab", "Altro"];
+
+const CYCLE_PHASES = [
+  { value: "stepup1", label: "Step-up dose 1 (C1D1)", risk: "alto" },
+  { value: "stepup2", label: "Step-up dose 2 (C1D8)", risk: "alto" },
+  { value: "fulldose_c1", label: "Dose piena C1 (C1D15)", risk: "medio" },
+  { value: "fulldose_c2", label: "Ciclo 2", risk: "medio" },
+  { value: "fulldose_c3plus", label: "Ciclo ≥3", risk: "basso" },
+];
+
+const RISK_SCORE_FACTORS = [
+  { id: "bulky", label: "Malattia bulky (>5 cm)" },
+  { id: "ldh_high", label: "LDH elevato (>ULN)" },
+  { id: "extranodal", label: "Coinvolgimento extranodale ≥2 siti" },
+  { id: "bone_marrow", label: "Coinvolgimento midollare" },
+  { id: "prior_car_t", label: "Precedente terapia CAR-T" },
+  { id: "ps_poor", label: "ECOG PS ≥2" },
+];
+
+const VITALS = [
+  { id: "temp", label: "Temperatura", unit: "°C", min: 35, max: 42, step: 0.1,
+    grading: v => v >= 38.0 ? (v >= 39.0 ? "g3" : v >= 38.5 ? "g2" : "g1") : "ok" },
+  { id: "spo2", label: "SpO₂", unit: "%", min: 70, max: 100, step: 1,
+    grading: v => v < 90 ? "g3" : v < 94 ? "g2" : "ok" },
+  { id: "sbp", label: "PA sistolica", unit: "mmHg", min: 60, max: 200, step: 1,
+    grading: v => v < 90 ? "g3" : v < 100 ? "g2" : "ok" },
+  { id: "fc", label: "Frequenza cardiaca", unit: "bpm", min: 30, max: 220, step: 1,
+    grading: v => v > 130 ? "g2" : v < 40 ? "g3" : "ok" },
+  { id: "tc", label: "Frequenza respiratoria", unit: "atti/min", min: 8, max: 50, step: 1,
+    grading: v => v > 30 ? "g3" : v > 24 ? "g2" : "ok" },
+];
+
+const SYMPTOMS_NEURO = [
+  { id: "confusion", label: "Confusione / disorientamento" },
+  { id: "speech_diff", label: "Difficoltà a parlare" },
+  { id: "writing_diff", label: "Difficoltà a scrivere" },
+  { id: "tremor", label: "Tremore" },
+  { id: "seizure", label: "Convulsioni" },
+  { id: "lethargy", label: "Sonnolenza eccessiva" },
+];
+
+const SYMPTOMS_OTHER = [
+  { id: "chills", label: "Brividi intensi" },
+  { id: "dyspnea", label: "Difficoltà respiratoria" },
+  { id: "headache", label: "Cefalea" },
+  { id: "nausea", label: "Nausea / vomito" },
+  { id: "fatigue", label: "Stanchezza marcata" },
+  { id: "myalgia", label: "Dolori muscolari/articolari" },
+  { id: "edema", label: "Gonfiore (faccia, collo, arti)" },
+  { id: "rash", label: "Arrossamento cutaneo" },
+];
+
+// CRS grade computation (ASTCT 2019 criteria)
+function computeCRS(entry) {
+  const temp = parseFloat(entry.temp);
+  const spo2 = parseFloat(entry.spo2);
+  const sbp = parseFloat(entry.sbp);
+  const hasFever = temp >= 38.0;
+  if (!hasFever || isNaN(temp)) return 0;
+  const hypotension = !isNaN(sbp) && sbp < 100;
+  const hypoxia_g2 = !isNaN(spo2) && spo2 >= 90 && spo2 < 94;
+  const hypoxia_g3 = !isNaN(spo2) && spo2 < 90;
+  const vasopressor = entry.vasopressor;
+  const o2_highflow = entry.o2_highflow;
+  if (hypoxia_g3 || o2_highflow || vasopressor) return 3;
+  if (hypoxia_g2 || hypotension) return 2;
+  return 1;
+}
+
+// ICANS suspicion
+function suspectICANS(entry) {
+  const neuroSx = ["confusion","speech_diff","writing_diff","tremor","seizure","lethargy"];
+  return neuroSx.some(s => entry[s]);
+}
+
+const GRADE_UI = {
+  0: { label: "Nessuna CRS", color: "#16a34a", bg: "#dcfce7", border: "#86efac" },
+  1: { label: "CRS Grado 1", color: "#d97706", bg: "#fef9c3", border: "#fde047" },
+  2: { label: "CRS Grado 2", color: "#ea580c", bg: "#ffedd5", border: "#fb923c" },
+  3: { label: "CRS Grado 3", color: "#dc2626", bg: "#fee2e2", border: "#f87171" },
+};
+
+const GRADE_ACTION = [
+  "Continua monitoraggio. Prossima rilevazione domani mattina.",
+  "Contatta il centro entro poche ore. Inizia antipiretici (Paracetamolo 1g) se non controindicato. Buona idratazione orale.",
+  "Contatta il centro OGGI in modo urgente. Non guidare. Tieni pronto il numero del PS di riferimento.",
+  "CHIAMA IL 118 O VAI IMMEDIATAMENTE AL PRONTO SOCCORSO DI RIFERIMENTO.",
+];
+
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
+
+function today() { return new Date().toISOString().slice(0, 10); }
+function nowTime() { return new Date().toTimeString().slice(0, 5); }
+function fmtDate(d) {
+  try { return new Date(d).toLocaleDateString("it-IT", { day: "2-digit", month: "short", year: "numeric" }); }
+  catch { return d; }
+}
+
+function downloadCSV(logs) {
+  const vitalCols = VITALS.map(v => v.id);
+  const neuroCols = SYMPTOMS_NEURO.map(s => s.id);
+  const otherCols = SYMPTOMS_OTHER.map(s => s.id);
+  const cols = ["data","ora","farmaco","ciclo","crs_grade","icans_sospetta",...vitalCols,...neuroCols,...otherCols,"desmeta_assunta","paracetamolo_assunto","note"];
+  const header = ["Data","Ora","Farmaco","Fase","Grado CRS","Sospetta ICANS",...VITALS.map(v=>`${v.label} (${v.unit})`),...SYMPTOMS_NEURO.map(s=>s.label),...SYMPTOMS_OTHER.map(s=>s.label),"Desametasone","Paracetamolo","Note"];
+  const rows = logs.map(e => cols.map(c => {
+    if (c==="data") return e.date||"";
+    if (c==="ora") return e.time||"";
+    if (c==="crs_grade") return e.crs_grade ?? "";
+    if (c==="icans_sospetta") return e.icans_sospetta ? "Sì" : "No";
+    if ([...neuroCols,...otherCols,"desmeta_assunta","paracetamolo_assunto"].includes(c)) return e[c] ? "Sì" : "No";
+    return e[c] ?? "";
+  }));
+  const csv = [header.join(";"), ...rows.map(r=>r.join(";"))].join("\n");
+  const blob = new Blob(["\uFEFF"+csv], { type:"text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a"); a.href=url; a.download=`monitoraggio_BsAb_${today()}.csv`; a.click();
+  URL.revokeObjectURL(url);
+}
+
+// ─── STYLES ──────────────────────────────────────────────────────────────────
+
+const C = {
+  navy: "#1a3557",
+  navyLight: "#2d5282",
+  gold: "#c8910a",
+  goldLight: "#f0b429",
+  cream: "#faf9f6",
+  cardBg: "#ffffff",
+  border: "#e2e8f0",
+  text: "#1e293b",
+  muted: "#64748b",
+  danger: "#dc2626",
+  warning: "#d97706",
+  success: "#16a34a",
+};
+
+const s = {
+  page: { fontFamily: "'Palatino Linotype', 'Book Antiqua', Palatino, Georgia, serif", background: C.cream, minHeight: "100vh", paddingBottom: 80 },
+  header: { background: `linear-gradient(135deg, ${C.navy} 0%, ${C.navyLight} 100%)`, color: "white", padding: "20px 20px 14px", borderBottom: `3px solid ${C.gold}` },
+  headerSub: { fontSize: 10, letterSpacing: 3, color: "#93c5fd", marginBottom: 3, textTransform: "uppercase" },
+  headerTitle: { fontSize: 20, fontWeight: 700, letterSpacing: -0.3 },
+  headerMeta: { fontSize: 12, color: "#7dd3fc", marginTop: 3 },
+  nav: { display: "flex", background: C.navy, overflowX: "auto" },
+  navBtn: (active) => ({
+    flexShrink: 0, padding: "11px 14px", border: "none", cursor: "pointer", fontSize: 12, fontWeight: 600,
+    background: active ? C.gold : "transparent",
+    color: active ? C.navy : "#93c5fd",
+    borderBottom: active ? `2px solid ${C.goldLight}` : "2px solid transparent",
+    whiteSpace: "nowrap", transition: "all 0.15s",
+  }),
+  wrap: { maxWidth: 540, margin: "0 auto", padding: "18px 14px" },
+  card: { background: C.cardBg, border: `1.5px solid ${C.border}`, borderRadius: 12, padding: "16px 16px", marginBottom: 14 },
+  sectionTitle: { fontSize: 10, fontWeight: 700, letterSpacing: 2.5, color: C.muted, textTransform: "uppercase", marginBottom: 10, paddingBottom: 6, borderBottom: `1px solid ${C.border}`, marginTop: 18 },
+  label: { display: "block", fontSize: 12, fontWeight: 600, color: C.muted, marginBottom: 4, letterSpacing: 0.2 },
+  input: (extra={}) => ({ width: "100%", padding: "9px 12px", border: `1.5px solid ${C.border}`, borderRadius: 8, fontSize: 14, color: C.text, boxSizing: "border-box", fontFamily: "inherit", outline: "none", background: "white", ...extra }),
+  select: { width: "100%", padding: "9px 12px", border: `1.5px solid ${C.border}`, borderRadius: 8, fontSize: 14, color: C.text, boxSizing: "border-box", fontFamily: "inherit", background: "white" },
+  checkRow: (checked) => ({
+    display: "flex", alignItems: "center", gap: 9,
+    background: checked ? "#eff6ff" : "white",
+    border: `1.5px solid ${checked ? "#3b82f6" : C.border}`,
+    borderRadius: 8, padding: "10px 12px", cursor: "pointer", fontSize: 13, color: C.text, transition: "all 0.12s", marginBottom: 6,
+  }),
+  btn: (variant="primary") => ({
+    padding: "11px 20px", border: "none", borderRadius: 9, fontWeight: 700, cursor: "pointer", fontSize: 14,
+    fontFamily: "inherit", letterSpacing: 0.3, transition: "all 0.15s",
+    ...(variant==="primary" ? { background: C.navy, color: "white" } : {}),
+    ...(variant==="gold" ? { background: C.gold, color: "white" } : {}),
+    ...(variant==="danger" ? { background: "#fee2e2", color: C.danger, border: `1px solid #fca5a5` } : {}),
+    ...(variant==="ghost" ? { background: "transparent", color: C.navy, border: `1.5px solid ${C.navy}` } : {}),
+  }),
+  pill: (color, bg) => ({ display: "inline-block", background: bg, color, borderRadius: 6, padding: "3px 10px", fontSize: 11, fontWeight: 700, letterSpacing: 0.3 }),
+  alertBox: (level) => {
+    const map = { red: ["#fee2e2","#dc2626","#fca5a5"], yellow: ["#fef9c3","#d97706","#fde047"], green: ["#dcfce7","#16a34a","#86efac"], blue: ["#eff6ff","#2563eb","#93c5fd"] };
+    const [bg,col,bor] = map[level]||map.blue;
+    return { background: bg, border: `2px solid ${bor}`, borderRadius: 10, padding: "14px 16px", marginBottom: 14, color: col };
+  },
+};
+
+// ─── SUBCOMPONENTS ────────────────────────────────────────────────────────────
+
+function VitalInput({ vital, value, onChange }) {
+  const numVal = parseFloat(value);
+  const grade = value !== "" && !isNaN(numVal) ? vital.grading(numVal) : "ok";
+  const gradeColors = { ok: [C.border,"white"], g1: ["#fde047","#fef9c3"], g2: ["#fb923c","#ffedd5"], g3: ["#f87171","#fee2e2"] };
+  const [bc, bg] = gradeColors[grade] || gradeColors.ok;
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <label style={s.label}>{vital.label} <span style={{ color: C.muted, fontWeight: 400 }}>({vital.unit})</span></label>
+      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+        <input type="number" min={vital.min} max={vital.max} step={vital.step} value={value} placeholder="—"
+          onChange={e => onChange(e.target.value)}
+          style={s.input({ borderColor: bc, background: bg, flex: 1 })} />
+        {grade !== "ok" && (
+          <span style={{ ...s.pill(grade==="g3"?C.danger:grade==="g2"?"#ea580c":C.warning, grade==="g3"?"#fee2e2":grade==="g2"?"#ffedd5":"#fef9c3") }}>
+            {grade==="g3"?"CRITICO":grade==="g2"?"ALTO":"ATT."}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function CheckItem({ label, checked, onChange }) {
+  return (
+    <label style={s.checkRow(checked)} onClick={() => onChange(!checked)}>
+      <input type="checkbox" checked={checked} onChange={e => onChange(e.target.checked)}
+        style={{ accentColor: C.navy, width: 15, height: 15, flexShrink: 0 }} />
+      {label}
+    </label>
+  );
+}
+
+// ─── TABS ─────────────────────────────────────────────────────────────────────
+
+// TAB 1 – SETUP PAZIENTE
+function TabSetup({ config, setConfig }) {
+  const [saved, setSaved] = useState(false);
+  function save() { setSaved(true); setTimeout(() => setSaved(false), 2000); }
+  const rf = (field, val) => setConfig(c => ({ ...c, [field]: val }));
+  const riskCount = RISK_SCORE_FACTORS.filter(f => config[f.id]).length;
+  const riskLabel = riskCount >= 3 ? { label: "ALTO", color: C.danger, bg: "#fee2e2" } : riskCount >= 1 ? { label: "INTERMEDIO", color: C.warning, bg: "#fef9c3" } : { label: "BASSO", color: C.success, bg: "#dcfce7" };
+
+  return (
+    <div style={s.wrap}>
+      <div style={{ ...s.alertBox("blue"), marginBottom: 0 }}>
+        <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 4 }}>ℹ️ Configurazione iniziale</div>
+        <div style={{ fontSize: 12, lineHeight: 1.6 }}>Completa questa sezione prima di consegnare il dispositivo al paziente. I dati restano in locale.</div>
+      </div>
+
+      {/* Patient identity */}
+      <div style={s.sectionTitle}>Dati paziente</div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 12 }}>
+        {[["patient_name","Nome / Iniziali"],["dob","Data di nascita"]].map(([id,lbl]) => (
+          <div key={id}>
+            <label style={s.label}>{lbl}</label>
+            <input style={s.input()} value={config[id]||""} onChange={e => rf(id, e.target.value)} />
+          </div>
+        ))}
+      </div>
+
+      {/* Drug & cycle */}
+      <div style={s.sectionTitle}>Terapia in corso</div>
+      <div style={{ marginBottom: 10 }}>
+        <label style={s.label}>Anticorpo bispecifico</label>
+        <select style={s.select} value={config.drug||""} onChange={e => rf("drug", e.target.value)}>
+          <option value="">— seleziona —</option>
+          {DRUGS.map(d => <option key={d} value={d}>{d}</option>)}
+        </select>
+      </div>
+      <div style={{ marginBottom: 10 }}>
+        <label style={s.label}>Fase di trattamento attuale</label>
+        <select style={s.select} value={config.cycle_phase||""} onChange={e => rf("cycle_phase", e.target.value)}>
+          <option value="">— seleziona —</option>
+          {CYCLE_PHASES.map(p => <option key={p.value} value={p.value}>{p.label} (rischio {p.risk})</option>)}
+        </select>
+      </div>
+      <div>
+        <label style={s.label}>Data ultima somministrazione</label>
+        <input type="date" style={s.input()} value={config.last_admin||""} onChange={e => rf("last_admin", e.target.value)} />
+      </div>
+
+      {/* CRS risk */}
+      <div style={s.sectionTitle}>Stratificazione rischio CRS (Gritti 2024)</div>
+      <div style={{ ...s.alertBox("blue"), padding: "10px 14px", marginBottom: 12, fontSize: 12 }}>
+        Fattori di rischio identificati per CRS da BsAb in linfoma. Seleziona quelli presenti.
+      </div>
+      {RISK_SCORE_FACTORS.map(f => (
+        <CheckItem key={f.id} label={f.label} checked={!!config[f.id]} onChange={v => rf(f.id, v)} />
+      ))}
+      <div style={{ ...s.card, display: "flex", alignItems: "center", gap: 12, marginTop: 4 }}>
+        <div style={{ width: 12, height: 12, borderRadius: "50%", background: riskLabel.color }} />
+        <div>
+          <span style={{ fontWeight: 700, color: riskLabel.color }}>Rischio CRS: {riskLabel.label}</span>
+          <span style={{ fontSize: 12, color: C.muted, marginLeft: 8 }}>{riskCount} fattori su {RISK_SCORE_FACTORS.length}</span>
+        </div>
+      </div>
+
+      {/* Emergency contacts */}
+      <div style={s.sectionTitle}>Contatti di emergenza (Punto 5 & 7)</div>
+      {[
+        ["center_phone","📞 Numero ambulatorio/centro ematologico"],
+        ["center_email","📧 Email / MyDoctor del centro"],
+        ["er_name","🏥 Pronto Soccorso di riferimento (nome)"],
+        ["er_address","📍 Indirizzo PS di riferimento"],
+        ["ward_name","🛏 Reparto ricovero preferenziale (Punto 8)"],
+        ["icu_name","🏥 Reparto ICU identificato (Punto 9)"],
+      ].map(([id,lbl]) => (
+        <div key={id} style={{ marginBottom: 10 }}>
+          <label style={s.label}>{lbl}</label>
+          <input style={s.input()} value={config[id]||""} placeholder="Da compilare..." onChange={e => rf(id, e.target.value)} />
+        </div>
+      ))}
+
+      {/* Tocilizumab */}
+      <div style={s.sectionTitle}>Disponibilità Tocilizumab (Punto 10)</div>
+      <div style={{ marginBottom: 10 }}>
+        <label style={s.label}>Tocilizumab disponibile in</label>
+        <input style={s.input()} value={config.toci_location||""} placeholder="es. Farmacia interna, PS, entrambi..." onChange={e => rf("toci_location", e.target.value)} />
+      </div>
+      <div>
+        <label style={s.label}>Note accesso Tocilizumab</label>
+        <textarea style={{ ...s.input(), minHeight: 60, resize: "vertical" }} value={config.toci_note||""} placeholder="es. Attivare piano terapeutico con nome medico prescrittore..." onChange={e => rf("toci_note", e.target.value)} />
+      </div>
+
+      {/* Caregiver */}
+      <div style={s.sectionTitle}>Caregiver (Punto 4)</div>
+      {[["caregiver_name","Nome caregiver"],["caregiver_phone","Telefono caregiver"]].map(([id,lbl]) => (
+        <div key={id} style={{ marginBottom: 10 }}>
+          <label style={s.label}>{lbl}</label>
+          <input style={s.input()} value={config[id]||""} onChange={e => rf(id, e.target.value)} />
+        </div>
+      ))}
+
+      <button style={{ ...s.btn("primary"), width: "100%", marginTop: 8 }} onClick={save}>
+        {saved ? "✓ Configurazione salvata" : "Salva configurazione"}
+      </button>
+    </div>
+  );
+}
+
+// TAB 2 – DIARIO SINTOMI
+function TabDiary({ config, logs, setLogs }) {
+  const [form, setForm] = useState({ date: today(), time: nowTime() });
+  const [saved, setSaved] = useState(false);
+  const rf = (k, v) => setForm(f => ({ ...f, [k]: v }));
+
+  const grade = computeCRS(form);
+  const icans = suspectICANS(form);
+  const gradeUI = GRADE_UI[grade];
+  const isUrgent = grade >= 2 || icans;
+  const isExtreme = grade >= 3 || form.seizure;
+
+  const criticalVitals = [];
+  VITALS.forEach(v => {
+    const val = parseFloat(form[v.id]);
+    if (!isNaN(val) && v.grading(val) === "g3") criticalVitals.push(v.label);
+  });
+  if (icans) criticalVitals.push("Sintomi neurologici (sospetta ICANS)");
+
+  function submit() {
+    const entry = { ...form, crs_grade: grade, icans_sospetta: icans, id: Date.now() };
+    setLogs(prev => [entry, ...prev]);
+    setSaved(true);
+    setTimeout(() => setSaved(false), 2500);
+    setForm({ date: today(), time: nowTime() });
+  }
+
+  return (
+    <div style={s.wrap}>
+      {/* CRS Banner */}
+      <div style={{ background: gradeUI.bg, border: `2px solid ${gradeUI.border}`, borderRadius: 12, padding: "14px 16px", marginBottom: 14 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6 }}>
+          <div style={{ width: 14, height: 14, borderRadius: "50%", background: gradeUI.color }} />
+          <span style={{ fontWeight: 800, fontSize: 16, color: gradeUI.color }}>{gradeUI.label}</span>
+          {icans && <span style={{ ...s.pill("#7c3aed","#ede9fe"), marginLeft: 4 }}>⚡ Sospetta ICANS</span>}
+        </div>
+        <div style={{ fontSize: 13, color: C.text, lineHeight: 1.5 }}>{GRADE_ACTION[grade]}</div>
+      </div>
+
+      {/* Critical alerts */}
+      {isExtreme && (
+        <div style={s.alertBox("red")}>
+          <div style={{ fontWeight: 800, fontSize: 14, marginBottom: 6 }}>🚨 CHIAMA SUBITO IL 118</div>
+          {config.er_name && <div style={{ fontSize: 13 }}>o recati al: <b>{config.er_name}</b></div>}
+          {config.er_address && <div style={{ fontSize: 12, marginTop: 2 }}>{config.er_address}</div>}
+          {criticalVitals.map(v => <div key={v} style={{ fontSize: 12, marginTop: 3 }}>⚠ {v}</div>)}
+        </div>
+      )}
+      {isUrgent && !isExtreme && (
+        <div style={s.alertBox("yellow")}>
+          <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 4 }}>⚠ Contatta il centro ora</div>
+          {config.center_phone && <div style={{ fontSize: 14, fontWeight: 700 }}>{config.center_phone}</div>}
+          {criticalVitals.map(v => <div key={v} style={{ fontSize: 12, marginTop: 2 }}>· {v}</div>)}
+        </div>
+      )}
+
+      {/* Date / time / drug */}
+      <div style={{ display: "flex", gap: 8, marginBottom: 4 }}>
+        <div style={{ flex: 2 }}>
+          <label style={s.label}>Data</label>
+          <input type="date" style={s.input()} value={form.date||""} onChange={e => rf("date",e.target.value)} />
+        </div>
+        <div style={{ flex: 1 }}>
+          <label style={s.label}>Ora</label>
+          <input type="time" style={s.input()} value={form.time||""} onChange={e => rf("time",e.target.value)} />
+        </div>
+      </div>
+
+      {/* Vitals */}
+      <div style={s.sectionTitle}>Parametri vitali</div>
+      {VITALS.map(v => (
+        <VitalInput key={v.id} vital={v} value={form[v.id]||""} onChange={val => rf(v.id, val)} />
+      ))}
+
+      {/* Additional critical flags */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 4 }}>
+        {[["vasopressor","Vasopressori in corso"],["o2_highflow","O₂ ad alti flussi/maschera"]].map(([id,lbl]) => (
+          <CheckItem key={id} label={lbl} checked={!!form[id]} onChange={v => rf(id,v)} />
+        ))}
+      </div>
+
+      {/* Neurological */}
+      <div style={s.sectionTitle}>Sintomi neurologici (ICANS)</div>
+      {SYMPTOMS_NEURO.map(sx => (
+        <CheckItem key={sx.id} label={sx.label} checked={!!form[sx.id]} onChange={v => rf(sx.id,v)} />
+      ))}
+
+      {/* Other symptoms */}
+      <div style={s.sectionTitle}>Altri sintomi</div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+        {SYMPTOMS_OTHER.map(sx => (
+          <CheckItem key={sx.id} label={sx.label} checked={!!form[sx.id]} onChange={v => rf(sx.id,v)} />
+        ))}
+      </div>
+
+      {/* Drugs taken */}
+      <div style={s.sectionTitle}>Farmaci assunti oggi</div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+        {[["desmeta_assunta","Desametasone"],["paracetamolo_assunto","Paracetamolo (Tachipirina)"]].map(([id,lbl]) => (
+          <CheckItem key={id} label={lbl} checked={!!form[id]} onChange={v => rf(id,v)} />
+        ))}
+      </div>
+
+      {/* Notes */}
+      <div style={s.sectionTitle}>Note libere</div>
+      <textarea style={{ ...s.input(), minHeight: 70, resize: "vertical" }}
+        value={form.note||""} onChange={e => rf("note",e.target.value)}
+        placeholder="Come ti senti? Hai assunto altri farmaci? Hai avuto bisogno di aiuto?" />
+
+      <button style={{ ...s.btn("primary"), width: "100%", marginTop: 14 }} onClick={submit}>
+        {saved ? "✓ Registrazione salvata" : "💾 Salva registrazione"}
+      </button>
+    </div>
+  );
+}
+
+// TAB 3 – STORICO & EXPORT
+function TabHistory({ logs, setLogs }) {
+  const [confirm, setConfirm] = useState(false);
+
+  if (logs.length === 0) return (
+    <div style={{ ...s.wrap, textAlign: "center", paddingTop: 60 }}>
+      <div style={{ fontSize: 40, marginBottom: 12 }}>📋</div>
+      <div style={{ color: C.muted, fontSize: 15 }}>Nessuna registrazione ancora.</div>
+      <div style={{ color: C.muted, fontSize: 13, marginTop: 6 }}>Inizia dalla scheda "Diario".</div>
+    </div>
+  );
+
+  return (
+    <div style={s.wrap}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+        <div style={{ fontWeight: 700, color: C.navy, fontSize: 15 }}>{logs.length} registrazioni</div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button style={s.btn("gold")} onClick={() => downloadCSV(logs)}>⬇ CSV</button>
+          {!confirm
+            ? <button style={s.btn("danger")} onClick={() => setConfirm(true)}>🗑 Elimina tutto</button>
+            : <button style={{ ...s.btn("danger"), background: C.danger, color: "white" }} onClick={() => { setLogs([]); setConfirm(false); }}>Conferma eliminazione</button>
+          }
+        </div>
+      </div>
+
+      {logs.map((e, i) => {
+        const gUI = GRADE_UI[Math.min(e.crs_grade ?? 0, 3)];
+        const positiveNeuro = SYMPTOMS_NEURO.filter(sx => e[sx.id]);
+        const positiveOther = SYMPTOMS_OTHER.filter(sx => e[sx.id]);
+        return (
+          <div key={e.id||i} style={{ ...s.card, borderLeft: `4px solid ${gUI.color}` }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 8 }}>
+              <div>
+                <div style={{ fontWeight: 700, color: C.navy, fontSize: 15 }}>{fmtDate(e.date)}</div>
+                <div style={{ fontSize: 12, color: C.muted }}>{e.time||""} {e.farmaco ? `· ${e.farmaco}` : ""}</div>
+              </div>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }}>
+                <span style={s.pill(gUI.color, gUI.bg)}>{gUI.label}</span>
+                {e.icans_sospetta && <span style={s.pill("#7c3aed","#ede9fe")}>ICANS?</span>}
+              </div>
+            </div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 6 }}>
+              {VITALS.map(v => e[v.id] !== undefined && e[v.id] !== "" && (
+                <span key={v.id} style={{ background: "#f1f5f9", borderRadius: 5, padding: "2px 8px", fontSize: 12, color: C.text }}>
+                  {v.id==="temp"?"T°":v.id==="spo2"?"SpO₂":v.id==="sbp"?"PA":v.id==="fc"?"FC":"FR"}: <b>{e[v.id]}{v.unit}</b>
+                </span>
+              ))}
+            </div>
+            {positiveNeuro.length > 0 && (
+              <div style={{ fontSize: 12, color: "#7c3aed", marginBottom: 4 }}>
+                🧠 {positiveNeuro.map(s=>s.label).join(" · ")}
+              </div>
+            )}
+            {positiveOther.length > 0 && (
+              <div style={{ fontSize: 12, color: C.muted, marginBottom: 4 }}>
+                {positiveOther.map(s=>s.label).join(" · ")}
+              </div>
+            )}
+            {e.note && <div style={{ fontSize: 12, color: C.text, fontStyle: "italic", marginTop: 4 }}>"{e.note}"</div>}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// TAB 4 – LETTERA PAZIENTE (Punto 6)
+function TabLetter({ config }) {
+  const cyclePhaseLabel = CYCLE_PHASES.find(p => p.value === config.cycle_phase)?.label || "—";
+  const riskCount = RISK_SCORE_FACTORS.filter(f => config[f.id]).length;
+  const riskLabel = riskCount >= 3 ? "ALTO" : riskCount >= 1 ? "INTERMEDIO" : "BASSO";
+
+  return (
+    <div style={s.wrap}>
+      <div style={{ ...s.alertBox("blue"), padding: "10px 14px", marginBottom: 12, fontSize: 12 }}>
+        📄 Questa è la "lettera del paziente" da mostrare al PS o al medico di guardia. Puoi stamparla o mostrarla dallo schermo.
+      </div>
+
+      <div style={{ background: "white", border: `2px solid ${C.navy}`, borderRadius: 12, padding: "20px 18px" }}>
+        {/* Header letter */}
+        <div style={{ borderBottom: `3px solid ${C.gold}`, paddingBottom: 12, marginBottom: 16 }}>
+          <div style={{ fontSize: 11, letterSpacing: 2, color: C.muted, textTransform: "uppercase" }}>Lettera di accompagnamento clinico</div>
+          <div style={{ fontSize: 18, fontWeight: 800, color: C.navy, marginTop: 4 }}>Paziente in trattamento con Anticorpi Bispecifici</div>
+        </div>
+
+        <div style={{ fontSize: 14, lineHeight: 1.8, color: C.text }}>
+          <p><b>Paziente:</b> {config.patient_name || "—"} &nbsp;|&nbsp; <b>Nato/a:</b> {config.dob || "—"}</p>
+          <p><b>Farmaco:</b> {config.drug || "—"} &nbsp;|&nbsp; <b>Fase:</b> {cyclePhaseLabel}</p>
+          <p><b>Ultima somministrazione:</b> {config.last_admin ? fmtDate(config.last_admin) : "—"}</p>
+          <p><b>Rischio CRS stimato:</b> <b style={{ color: riskCount>=3?C.danger:riskCount>=1?C.warning:C.success }}>{riskLabel}</b></p>
+          <p><b>Centro di riferimento:</b> {config.center_phone || "—"}</p>
+        </div>
+
+        <div style={{ background: "#fff7ed", border: `1.5px solid #fb923c`, borderRadius: 8, padding: "12px 14px", marginTop: 16, marginBottom: 16 }}>
+          <div style={{ fontWeight: 700, color: "#9a3412", marginBottom: 6, fontSize: 13 }}>⚠ Al medico del Pronto Soccorso</div>
+          <div style={{ fontSize: 13, color: C.text, lineHeight: 1.7 }}>
+            Questo paziente è in trattamento con un anticorpo bispecifico CD20xCD3 / CD3xCD19 (terapia immunologica redirezionante le cellule T). Può sviluppare:
+            <ul style={{ margin: "6px 0 0 16px" }}>
+              <li><b>CRS (Cytokine Release Syndrome)</b>: febbre, ipotensione, ipossia — risponde a supporto + <b>Tocilizumab 8 mg/kg IV</b> (± Desametasone)</li>
+              <li><b>ICANS</b>: confusione, afasia, tremore, convulsioni — gestire con Desametasone; rivalutare neurologia</li>
+            </ul>
+          </div>
+        </div>
+
+        <div style={{ background: "#f0fdf4", border: "1.5px solid #86efac", borderRadius: 8, padding: "12px 14px", marginBottom: 12 }}>
+          <div style={{ fontWeight: 700, color: "#14532d", fontSize: 13, marginBottom: 6 }}>Grading CRS (ASTCT 2019)</div>
+          {[
+            ["G1","Febbre ≥38°C senza ipotensione/ipossia → Paracetamolo, osservazione"],
+            ["G2","Febbre + ipotensione rispondente a fluidi e/o O₂ a bassa portata → Tocilizumab"],
+            ["G3","Ipotensione con vasopressori o O₂ ad alti flussi → Tocilizumab + Desametasone, ricovero"],
+            ["G4","Pericolo di vita → ICU, terapia intensiva"],
+          ].map(([g,desc]) => (
+            <div key={g} style={{ fontSize: 12, marginBottom: 4 }}><b style={{ color: C.navy }}>{g}:</b> {desc}</div>
+          ))}
+        </div>
+
+        <div style={{ background: "#faf5ff", border: "1.5px solid #d8b4fe", borderRadius: 8, padding: "12px 14px", marginBottom: 16 }}>
+          <div style={{ fontWeight: 700, color: "#581c87", fontSize: 13, marginBottom: 6 }}>Disponibilità Tocilizumab</div>
+          <div style={{ fontSize: 13 }}>{config.toci_location || "Da definire con il centro"}</div>
+          {config.toci_note && <div style={{ fontSize: 12, color: C.muted, marginTop: 4 }}>{config.toci_note}</div>}
+        </div>
+
+        <div style={{ borderTop: `1px solid ${C.border}`, paddingTop: 12, fontSize: 12, color: C.muted }}>
+          <div><b>Centro ematologico:</b> {config.center_phone||"—"} {config.center_email ? `· ${config.center_email}` : ""}</div>
+          <div><b>PS di riferimento:</b> {config.er_name||"—"} {config.er_address ? `· ${config.er_address}` : ""}</div>
+          <div><b>Reparto ricovero:</b> {config.ward_name||"—"} &nbsp;|&nbsp; <b>ICU:</b> {config.icu_name||"—"}</div>
+          <div style={{ marginTop: 8, fontStyle: "italic" }}>Documento generato il {fmtDate(today())} · Diario monitoraggio BsAb</div>
+        </div>
+      </div>
+
+      <button style={{ ...s.btn("gold"), width: "100%", marginTop: 14 }} onClick={() => window.print()}>
+        🖨 Stampa / Salva come PDF
+      </button>
+    </div>
+  );
+}
+
+// TAB 5 – CHECKLIST CAREGIVER (Punto 3 & 4)
+function TabCaregiver({ config }) {
+  const [checked, setChecked] = useState({});
+  const toggle = id => setChecked(c => ({ ...c, [id]: !c[id] }));
+
+  const items = [
+    { id: "c1", group: "Monitoraggio quotidiano", label: "Misura la temperatura ogni mattina (e se ha febbre)" },
+    { id: "c2", group: "Monitoraggio quotidiano", label: "Controlla la SpO₂ con il pulsossimetro" },
+    { id: "c3", group: "Monitoraggio quotidiano", label: "Misura la pressione arteriosa" },
+    { id: "c4", group: "Monitoraggio quotidiano", label: "Chiedi della frequenza cardiaca e respiratoria se disponibile" },
+    { id: "c5", group: "Monitoraggio quotidiano", label: "Compila il diario nell'app insieme al paziente" },
+    { id: "c6", group: "Segnali d'allarme CRS", label: "Febbre ≥38°C → contatta il centro" },
+    { id: "c7", group: "Segnali d'allarme CRS", label: "Febbre + difficoltà a respirare → PS immediatamente" },
+    { id: "c8", group: "Segnali d'allarme CRS", label: "Pressione bassa + sudore freddo → PS immediatamente" },
+    { id: "c9", group: "Segnali d'allarme ICANS", label: "Confusione o disorientamento → PS immediatamente" },
+    { id: "c10", group: "Segnali d'allarme ICANS", label: "Difficoltà a parlare o scrivere → PS immediatamente" },
+    { id: "c11", group: "Segnali d'allarme ICANS", label: "Tremore o convulsioni → 118 subito" },
+    { id: "c12", group: "Farmaci", label: "Desametasone disponibile in casa" },
+    { id: "c13", group: "Farmaci", label: "Paracetamolo (Tachipirina) disponibile in casa" },
+    { id: "c14", group: "Contatti noti", label: `Centro: ${config.center_phone||"—"} — numero salvato in telefono` },
+    { id: "c15", group: "Contatti noti", label: `PS: ${config.er_name||"—"} — indirizzo noto` },
+  ];
+
+  const groups = [...new Set(items.map(i => i.group))];
+  const doneCount = items.filter(i => checked[i.id]).length;
+
+  return (
+    <div style={s.wrap}>
+      <div style={{ ...s.card, display: "flex", alignItems: "center", gap: 12 }}>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontWeight: 700, color: C.navy }}>Checklist caregiver</div>
+          <div style={{ fontSize: 12, color: C.muted }}>{doneCount}/{items.length} completati</div>
+        </div>
+        <div style={{ fontSize: 24, fontWeight: 800, color: doneCount===items.length?C.success:C.gold }}>
+          {Math.round(doneCount/items.length*100)}%
+        </div>
+      </div>
+
+      {groups.map(group => (
+        <div key={group}>
+          <div style={s.sectionTitle}>{group}</div>
+          {items.filter(i => i.group===group).map(item => (
+            <label key={item.id} style={{ ...s.checkRow(checked[item.id]), fontSize: 13, cursor: "pointer" }}>
+              <input type="checkbox" checked={!!checked[item.id]} onChange={() => toggle(item.id)}
+                style={{ accentColor: C.navy, width: 15, height: 15, flexShrink: 0 }} />
+              {item.label}
+            </label>
+          ))}
+        </div>
+      ))}
+
+      <button style={{ ...s.btn("ghost"), width: "100%", marginTop: 8 }} onClick={() => setChecked({})}>
+        Reset checklist
+      </button>
+    </div>
+  );
+}
+
+// TAB 6 – INFO TOCI & GESTIONE
+function TabInfo({ config }) {
+  return (
+    <div style={s.wrap}>
+      <div style={s.sectionTitle}>Numeri utili</div>
+      <div style={s.card}>
+        {[
+          ["📞 Centro ematologico", config.center_phone],
+          ["📧 Email centro", config.center_email],
+          ["🏥 Pronto Soccorso", `${config.er_name||"—"} · ${config.er_address||""}`],
+          ["🛏 Reparto ricovero", config.ward_name],
+          ["🏥 ICU", config.icu_name],
+          ["👤 Caregiver", `${config.caregiver_name||"—"} · ${config.caregiver_phone||""}`],
+        ].map(([lbl, val]) => (
+          <div key={lbl} style={{ display: "flex", gap: 10, paddingBottom: 10, marginBottom: 10, borderBottom: `1px solid ${C.border}` }}>
+            <div style={{ fontSize: 13, color: C.muted, width: 160, flexShrink: 0 }}>{lbl}</div>
+            <div style={{ fontSize: 13, fontWeight: 600, color: C.navy }}>{val || <span style={{ color: "#cbd5e1" }}>Non configurato</span>}</div>
+          </div>
+        ))}
+      </div>
+
+      <div style={s.sectionTitle}>Gestione CRS — Algoritmo rapido</div>
+      {[
+        { grade: "G1", col: "#d97706", bg: "#fef9c3", text: "Febbre ≥38°C senza ipotensione né ipossia. → Paracetamolo 1g. Osservazione. Contatta centro." },
+        { grade: "G2", col: "#ea580c", bg: "#ffedd5", text: "Febbre + ipotensione (risponde a fluidi) e/o O₂ a bassa portata. → Tocilizumab 8 mg/kg IV. Valuta ricovero." },
+        { grade: "G3", col: "#dc2626", bg: "#fee2e2", text: "Ipotensione con vasopressori o O₂ ad alti flussi/CPAP. → Tocilizumab + Desametasone 10 mg IV. Ricovero urgente." },
+        { grade: "G4", col: "#7f1d1d", bg: "#fecaca", text: "Pericolo di vita. → ICU. Considerare seconda dose Tocilizumab o Siltuximab. Evitare steroidi ad alte dosi senza specialista." },
+      ].map(item => (
+        <div key={item.grade} style={{ background: item.bg, border: `1.5px solid ${item.col}`, borderRadius: 9, padding: "12px 14px", marginBottom: 10 }}>
+          <div style={{ fontWeight: 800, color: item.col, fontSize: 14, marginBottom: 4 }}>CRS {item.grade}</div>
+          <div style={{ fontSize: 13, color: C.text, lineHeight: 1.6 }}>{item.text}</div>
+        </div>
+      ))}
+
+      <div style={s.sectionTitle}>ICANS — Gestione</div>
+      <div style={{ ...s.card, borderLeft: `4px solid #7c3aed` }}>
+        <div style={{ fontSize: 13, lineHeight: 1.8, color: C.text }}>
+          <p><b>Sospetta ICANS se:</b> confusione, afasia, tremore, crisi epilettiche, letargia, alterazione coscienza.</p>
+          <p><b>ICE Score</b> (0–10): orientamento, denominazione, comprensione comandi, scrittura, attenzione. Score ≤6 → ICANS G2+.</p>
+          <p><b>Trattamento:</b> Desametasone 10 mg IV q6h per G2; valutazione neurologica urgente. Tocilizumab NON efficace su ICANS isolata.</p>
+          <p><b>Escludere:</b> meningoencefalite, ipoglicemia, stroke, altri farmaci.</p>
+        </div>
+      </div>
+
+      <div style={s.sectionTitle}>Tocilizumab — Informazioni (Punto 10)</div>
+      <div style={s.card}>
+        <div style={{ fontSize: 13, lineHeight: 1.8, color: C.text }}>
+          <p><b>Dose:</b> 8 mg/kg IV (max 800 mg per dose). Seconda dose dopo 8-12h se non risposta.</p>
+          <p><b>Disponibilità in questo centro:</b><br />{config.toci_location || <i style={{ color: C.muted }}>Non configurato</i>}</p>
+          {config.toci_note && <p><b>Note accesso:</b> {config.toci_note}</p>}
+          <p style={{ fontSize: 11, color: C.muted, marginTop: 8 }}>Riferimento: ASTCT 2019 Consensus Grading; EHA/ESMO guidelines BsAb toxicity management.</p>
+        </div>
+      </div>
+
+      <div style={s.sectionTitle}>Finestre temporali di rischio CRS</div>
+      <div style={s.card}>
+        {[
+          ["Step-up dose 1", "Prime 24–72h", "alto"],
+          ["Step-up dose 2 (C1D8)", "24–48h post dose", "alto"],
+          ["Dose piena C1D15", "12–48h post dose", "medio"],
+          ["Cicli successivi ≥C2", "Rischio decrescente", "basso"],
+        ].map(([fase, finestra, risk]) => (
+          <div key={fase} style={{ display: "flex", gap: 10, alignItems: "center", paddingBottom: 8, marginBottom: 8, borderBottom: `1px solid ${C.border}` }}>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 13, fontWeight: 600 }}>{fase}</div>
+              <div style={{ fontSize: 12, color: C.muted }}>{finestra}</div>
+            </div>
+            <span style={s.pill(risk==="alto"?C.danger:risk==="medio"?C.warning:C.success, risk==="alto"?"#fee2e2":risk==="medio"?"#fef9c3":"#dcfce7")}>
+              {risk.toUpperCase()}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── MAIN APP ─────────────────────────────────────────────────────────────────
+
+const TABS = [
+  { id: "setup", label: "⚙️ Setup" },
+  { id: "diary", label: "📋 Diario" },
+  { id: "history", label: "📊 Storico" },
+  { id: "letter", label: "📄 Lettera PS" },
+  { id: "caregiver", label: "👤 Caregiver" },
+  { id: "info", label: "ℹ️ Gestione" },
+];
+
+export default function App() {
+  const [tab, setTab] = useState("setup");
+  const [config, setConfig] = useState(() => {
+    try { return JSON.parse(localStorage.getItem(STORAGE_KEY+"_config") || "{}"); } catch { return {}; }
+  });
+  const [logs, setLogs] = useState(() => {
+    try { return JSON.parse(localStorage.getItem(STORAGE_KEY+"_logs") || "[]"); } catch { return []; }
+  });
+
+  useEffect(() => { localStorage.setItem(STORAGE_KEY+"_config", JSON.stringify(config)); }, [config]);
+  useEffect(() => { localStorage.setItem(STORAGE_KEY+"_logs", JSON.stringify(logs)); }, [logs]);
+
+  // Detect missing setup
+  const setupComplete = config.drug && config.center_phone && config.er_name;
+
+  return (
+    <div style={s.page}>
+      <div style={s.header}>
+        <div style={s.headerSub}>Ematologia · Monitoraggio Domiciliare</div>
+        <div style={s.headerTitle}>BsAb Patient Monitor</div>
+        <div style={s.headerMeta}>
+          {config.patient_name && <span>{config.patient_name} · </span>}
+          {config.drug && <span>{config.drug} · </span>}
+          {config.cycle_phase && <span>{CYCLE_PHASES.find(p=>p.value===config.cycle_phase)?.label || ""}</span>}
+          {!config.drug && <span style={{ color: "#fbbf24" }}>⚠ Configura il paziente prima dell'uso</span>}
+        </div>
+      </div>
+
+      <div style={s.nav}>
+        {TABS.map(t => (
+          <button key={t.id} style={s.navBtn(tab===t.id)} onClick={() => setTab(t.id)}>
+            {t.label}
+            {t.id==="history" && logs.length > 0 && (
+              <span style={{ marginLeft: 5, background: C.gold, color: C.navy, borderRadius: 10, padding: "1px 6px", fontSize: 10 }}>{logs.length}</span>
+            )}
+          </button>
+        ))}
+      </div>
+
+      {!setupComplete && tab !== "setup" && (
+        <div style={{ maxWidth: 540, margin: "12px auto 0", padding: "0 14px" }}>
+          <div style={{ ...s.alertBox("yellow"), cursor: "pointer" }} onClick={() => setTab("setup")}>
+            <span style={{ fontWeight: 700, fontSize: 13 }}>⚠ Setup incompleto</span>
+            <span style={{ fontSize: 12, marginLeft: 8 }}>Farmaco, numero centro o PS non configurati → Vai a Setup</span>
+          </div>
+        </div>
+      )}
+
+      {tab === "setup" && <TabSetup config={config} setConfig={setConfig} />}
+      {tab === "diary" && <TabDiary config={config} logs={logs} setLogs={setLogs} />}
+      {tab === "history" && <TabHistory logs={logs} setLogs={setLogs} />}
+      {tab === "letter" && <TabLetter config={config} />}
+      {tab === "caregiver" && <TabCaregiver config={config} />}
+      {tab === "info" && <TabInfo config={config} />}
+    </div>
+  );
+}
